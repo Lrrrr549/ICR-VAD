@@ -1,0 +1,154 @@
+import os
+import csv
+import argparse
+import json
+import sys
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+from sklearn.metrics import roc_auc_score, average_precision_score
+from tqdm import tqdm
+
+# Ensure local imports work
+try:
+    from pipeline_qwenvl_abli import build_pipeline
+except ImportError:
+    sys.path.append(os.path.dirname(__file__))
+    from pipeline_qwenvl_abli import build_pipeline
+
+
+def load_test_list(csv_path: str) -> List[str]:
+    feats: List[str] = []
+    with open(csv_path, 'r') as f:
+        sample = f.read(4096)
+        f.seek(0)
+        if ',' in sample:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row: continue
+                p = row[0].strip()
+                if p: feats.append(p)
+        else:
+            for line in f:
+                p = line.strip()
+                if p: feats.append(p)
+    return feats
+
+
+def load_gt_any(gt_path: str) -> Tuple[str, object]:
+    gt_raw = np.load(gt_path, allow_pickle=True)
+    if isinstance(gt_raw, np.ndarray) and gt_raw.dtype != object and gt_raw.ndim == 1:
+        return 'vector', gt_raw.astype(np.int64)
+
+    def normalize_key(k: str) -> str:
+        return os.path.splitext(os.path.basename(str(k)))[0]
+
+    normalized: Dict[str, np.ndarray] = {}
+    if isinstance(gt_raw, dict):
+        for k, v in gt_raw.items():
+            normalized[normalize_key(k)] = np.asarray(v).astype(np.int64)
+        return 'map', normalized
+
+    if isinstance(gt_raw, np.ndarray) and gt_raw.shape == ():
+        try:
+            obj = gt_raw.item()
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    normalized[normalize_key(k)] = np.asarray(v).astype(np.int64)
+                return 'map', normalized
+        except Exception: pass
+
+    raise ValueError(f"Unsupported gt format at {gt_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Evaluate VadCLIP + Qwen3-VL AUC on UCF-Crime')
+    parser.add_argument('--test-list', type=str, default='/root/VadCLIP/list/ucf_CLIP_rgbtest.csv')
+    parser.add_argument('--gt-path', type=str, default='/root/VadCLIP/list/gt_ucf.npy')
+    parser.add_argument('--vadclip-ckpt', type=str, default='/root/VadCLIP/model_ucf.pth')
+    parser.add_argument('--qwen-path', type=str, default='/root/autodl-tmp/Qwen3-VL-8B-Instruct')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--select-frames', type=int, default=12)
+    parser.add_argument('--weight', type=float, default=0.5)
+    parser.add_argument('--window-size', type=int, default=5)
+    parser.add_argument('--limit', type=int, default=None)
+    parser.add_argument('--sampling-method', type=str, choices=['density', 'uniform', 'topk'], default='density')
+    parser.add_argument('--save-json', type=str, default='/root/results/ucf_crime_results_qwen3vl.json')
+    args = parser.parse_args()
+
+    feats = load_test_list(args.test_list)
+    if args.limit is not None:
+        feats = feats[:max(1, args.limit)]
+
+    gt_mode, gt_data = load_gt_any(args.gt_path)
+    pipeline = build_pipeline(args.vadclip_ckpt, args.qwen_path, args.device)
+
+    all_preds: List[np.ndarray] = []
+    all_labels: List[np.ndarray] = []
+    per_video_results = {}
+    gt_offset = 0
+
+    for idx, feat_path in tqdm(enumerate(feats)):
+        if not os.path.exists(feat_path):
+            print(f"[WARN] Missing: {feat_path}")
+            continue
+        # print(f"[{idx+1}/{len(feats)}] Running: {feat_path}")
+        # try:
+        #     res = pipeline.run(
+        #         feature_path=feat_path,
+        #         select_frames=args.select_frames,
+        #         weight=args.weight,
+        #         window_size=args.window_size,
+        #     )
+        # except Exception as e:
+        #     print(f"[ERROR] Failed {feat_path}: {e}")
+        #     continue
+
+        res = pipeline.run(
+            feature_path=feat_path,
+            select_frames=args.select_frames,
+            weight=args.weight,
+            window_size=args.window_size,
+            sampling_method=args.sampling_method,
+        )
+        y_pred = np.asarray(res['full_video_scores'], dtype=float)
+        
+        if gt_mode == 'vector':
+            if gt_offset >= len(gt_data): break
+            L = min(len(y_pred), len(gt_data) - gt_offset)
+            y_true = gt_data[gt_offset:gt_offset + L]
+            gt_offset += L
+            y_pred = y_pred[:L]
+        else:
+            # Simplified map matching for brevity
+            stem = os.path.splitext(os.path.basename(feat_path))[0].split('__')[0]
+            y_true = gt_data.get(stem)
+            if y_true is None: continue
+            L = min(len(y_pred), len(y_true))
+            y_pred, y_true = y_pred[:L], y_true[:L]
+
+        all_preds.append(y_pred)
+        all_labels.append(y_true)
+        
+        vid_key = os.path.splitext(os.path.basename(res.get('video_path', feat_path)))[0]
+        per_video_results[vid_key] = {'auc': float(roc_auc_score(y_true, y_pred)) if len(np.unique(y_true)) > 1 else 0.0}
+
+    if not all_preds:
+        print("No results.")
+        return
+
+    y_pred_cat = np.concatenate(all_preds)
+    y_true_cat = np.concatenate(all_labels)
+    auc = roc_auc_score(y_true_cat, y_pred_cat)
+    ap = average_precision_score(y_true_cat, y_pred_cat)
+
+    summary = {'auc': float(auc),'ap': float(ap), 'num_videos': len(all_preds)}
+    print(json.dumps(summary, indent=2))
+
+    os.makedirs(os.path.dirname(args.save_json), exist_ok=True)
+    with open(args.save_json, 'w') as f:
+        json.dump({'summary': summary, 'per_video': per_video_results}, f)
+
+
+if __name__ == '__main__':
+    main()
